@@ -1,0 +1,40 @@
+# =============================================================================
+# Memo Automator Configuration
+# =============================================================================
+# Adjust these settings for each project / proforma-memo pair.
+
+# --- Proforma settings ---
+proforma:
+  # Which Excel tabs to extract data from (order doesn't matter)
+  tabs:
+    - "Executive Summary"
+    - "Development Summary"
+    - "Cash Flow"
+    - "Assumptions"
+    - "Comparison"
+
+  # Maximum rows to read per tab (0 = read all rows).
+  # Keeps API payload manageable; 250 is usually more than enough.
+  max_rows_per_tab: 250
+
+  # Maximum columns to read per tab (0 = read all columns).
+  max_cols_per_tab: 30
+
+# --- Memo settings ---
+memo:
+  # Pages to scan for metrics. Use "all" to scan every slide in the deck,
+  # or provide a list of specific page numbers, e.g. [3, 4, 6, 10, 11, 12].
+  pages: "all"
+
+# --- Claude API settings ---
+claude:
+  # Model to use for the mapping analysis.
+  # "claude-sonnet-4-20250514" is fast and cost-effective.
+  # "claude-opus-4-20250514" is slower but more accurate for complex memos.
+  model: "claude-sonnet-4-20250514"
+
+  # Max tokens for the mapping response
+  max_tokens: 16000
+
+  # Temperature (0 = deterministic; recommended for financial data)
+  temperature: 0
