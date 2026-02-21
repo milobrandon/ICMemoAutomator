@@ -31,6 +31,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -73,6 +74,11 @@ def parse_args():
         action="store_true",
         help="Show what would change without modifying the memo",
     )
+    p.add_argument(
+        "--skip-validation",
+        action="store_true",
+        help="Skip the Claude validation pass for faster runs",
+    )
     return p.parse_args()
 
 
@@ -87,14 +93,15 @@ def load_config(config_path: str) -> dict:
     cfg.setdefault("proforma", {})
     cfg["proforma"].setdefault("tabs", [
         "Executive Summary", "Development Summary", "Cash Flow",
-        "Assumptions", "Comparison"
+        "Assumptions", "Proforma Comparison"
     ])
     cfg["proforma"].setdefault("max_rows_per_tab", 250)
     cfg["proforma"].setdefault("max_cols_per_tab", 30)
     cfg.setdefault("memo", {})
     cfg["memo"].setdefault("pages", "all")
     cfg.setdefault("claude", {})
-    cfg["claude"].setdefault("model", "claude-sonnet-4-20250514")
+    cfg["claude"].setdefault("model", "claude-sonnet-4-6")
+    cfg["claude"].setdefault("validation_model", cfg["claude"]["model"])
     cfg["claude"].setdefault("max_tokens", 16000)
     cfg["claude"].setdefault("temperature", 0)
     return cfg
@@ -151,9 +158,9 @@ def extract_proforma_data(proforma_path: str, cfg: dict) -> str:
             row_data = []
             for cell in row:
                 if cell.value is not None:
-                    row_data.append(f"{cell.coordinate}: {cell.value}")
+                    row_data.append(str(cell.value))
             if row_data:
-                lines.append(" | ".join(row_data))
+                lines.append(f"Row {row[0].row}:\t" + "\t".join(row_data))
 
     wb.close()
     proforma_text = "\n".join(lines)
@@ -275,6 +282,44 @@ metric in the memo that should be updated with new values from the proforma.
    metric (e.g. "Bed count has increased ... to 510 beds"), emit an entry with
    the minimal old text snippet and its replacement.
 
+3. **Derived / calculated values** — When a source value changes, check
+   whether derived values in the memo should also change: totals, subtotals,
+   ratios (e.g. parking ratio, cost per bed/unit), per-bed or per-unit
+   metrics, summed pipeline beds/units, and sensitivity-table outputs.
+   Perform the arithmetic and emit updates for each derived value.
+
+4. **Pipeline / comp summary tables (row-oriented)** — Tables where each
+   ROW is a property (columns = metrics like units, beds, year, rent).
+   The first data row is always the subject property.  Update the subject
+   property's row to match the proforma — units, beds, delivery year,
+   address, rents, ratios.  If the subject appears under a prior project
+   name (e.g. a rebranded project in the same row position), update that
+   row too.
+
+5. **Competitive set side-by-side tables (column-oriented)** — Tables
+   where each COLUMN is a property and rows are metrics (unit size, beds,
+   market rent per unit type).  The subject property is ALWAYS the
+   leftmost data column.  Update EVERY cell in that column — header
+   metrics (units, beds, parking, ratios) AND each unit-type sub-section
+   (unit size, bed count, market rent).
+   - **Unit mix source:** Use the unit mix near the TOP of the Assumptions
+     tab (the detailed breakdown), NOT the unit mix summary.
+   - **Row matching:** Place each proforma unit type in the row whose
+     bedroom label matches (e.g. a "1BR" proforma unit goes in the "1BR"
+     row).  If the table has multiple rows for one bedroom type (e.g. two
+     "4BR" rows), distribute proforma units to the row whose competitive-
+     set values (size, rent) are the closest match.
+   - **Overflow (more proforma types than slots):** When there are more
+     proforma unit types than the table has rows for that bedroom count,
+     combine the two most similar in size into a range for both size and
+     rent (e.g. "490 - 550 sf" and "$1,325 - $1,435").
+   - When the memo shows a range but the proforma has a single value,
+     replace the range with the proforma value.
+
+6. **Address and name consistency** — If the proforma's property address or
+   name differs from the memo, update every occurrence in both tables and
+   narrative text to match the proforma.
+
 Return ONLY valid JSON (no markdown fences, no commentary) matching this
 schema exactly:
 
@@ -301,14 +346,187 @@ schema exactly:
 }}
 
 Important:
+- ONLY include entries where the new value DIFFERS from the old value.
+  If a memo metric already matches the proforma, skip it entirely.
 - old_value / old_text must be the EXACT text currently in the memo.
 - new_value / new_text must match the memo's formatting style.
 - For dollar amounts use commas: $68,769,750 not $68769750.
 - For percentages keep the same decimal places as the memo uses.
-- Only include metrics that clearly map to the proforma. Do NOT guess.
+- Do NOT fabricate data, but DO perform arithmetic to update derived values
+  whose inputs have changed (totals, ratios, per-unit metrics, etc.).
 - Scan ALL pages including large data tables (e.g. executive summary,
   cash flow, unit mix, development budget tables that may span full pages).
 """
+
+
+def _salvage_truncated_json(raw: str) -> dict | None:
+    """
+    Attempt to recover valid mappings from a truncated JSON response.
+
+    When Claude hits max_tokens mid-JSON, the response ends abruptly.
+    This function tries to close the JSON by finding the last complete
+    entry boundary (a '},' or '}]' pattern) and appending the missing
+    closing brackets.
+
+    Returns a valid mappings dict if salvageable, None otherwise.
+    """
+    text = raw.strip()
+    if not text:
+        return None
+
+    # Strip markdown fences if present
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+
+    # Must start with a JSON object
+    start = text.find("{")
+    if start == -1:
+        return None
+    text = text[start:]
+
+    # Strategy: try a few common closing patterns to complete the JSON.
+    # The response is typically:
+    #   {"table_updates": [..., {last_complete}, {partial   <-- cut here
+    # or:
+    #   {"table_updates": [...], "text_updates": [..., {partial   <-- cut here
+
+    closings_to_try = [
+        # Already inside a text_updates array — close entry + array + object
+        (r'\}\s*,?\s*$', '}], "text_updates": []}'),       # mid table_updates array entry boundary
+        (r'\}\s*\]\s*,?\s*$', '], "text_updates": []}'),   # end of table_updates array
+        (r'\}\s*,?\s*$', '}]}'),                            # mid text_updates array entry boundary
+        (r'\}\s*\]\s*,?\s*$', ']}'),                        # end of text_updates array
+        (r'\}\s*\]\s*\}\s*$', None),                        # already complete
+    ]
+
+    # Find the last complete entry: look for the last '}' that's followed
+    # by ',' or ']' or is at a natural boundary
+    # Walk backwards to find last complete "}" entry
+    last_good = -1
+    depth = 0
+    for i in range(len(text) - 1, -1, -1):
+        ch = text[i]
+        if ch == '}':
+            if depth == 0:
+                last_good = i
+                break
+            depth -= 1
+        elif ch == '{':
+            depth += 1
+
+    if last_good == -1:
+        return None
+
+    truncated = text[:last_good + 1]
+
+    # Count unmatched brackets to determine what closings are needed
+    open_braces = truncated.count('{') - truncated.count('}')
+    open_brackets = truncated.count('[') - truncated.count(']')
+
+    if open_braces < 0 or open_brackets < 0:
+        return None
+
+    # Build closing sequence: close all open brackets then braces
+    closing = ']' * open_brackets + '}' * open_braces
+    candidate = truncated + closing
+
+    try:
+        mappings = json.loads(candidate)
+        mappings.setdefault("table_updates", [])
+        mappings.setdefault("text_updates", [])
+        n = len(mappings["table_updates"]) + len(mappings["text_updates"])
+        if n > 0:
+            log.info("Salvaged %d updates from truncated response", n)
+            return mappings
+        return None
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: try trimming back to last '},' boundary (complete array entry)
+    last_comma_boundary = truncated.rfind('},')
+    if last_comma_boundary == -1:
+        return None
+
+    truncated2 = truncated[:last_comma_boundary + 1]
+    open_braces2 = truncated2.count('{') - truncated2.count('}')
+    open_brackets2 = truncated2.count('[') - truncated2.count(']')
+    if open_braces2 < 0 or open_brackets2 < 0:
+        return None
+
+    closing2 = ']' * open_brackets2 + '}' * open_braces2
+    candidate2 = truncated2 + closing2
+
+    try:
+        mappings = json.loads(candidate2)
+        mappings.setdefault("table_updates", [])
+        mappings.setdefault("text_updates", [])
+        n = len(mappings["table_updates"]) + len(mappings["text_updates"])
+        if n > 0:
+            log.info("Salvaged %d updates from truncated response (fallback)", n)
+            return mappings
+        return None
+    except json.JSONDecodeError:
+        log.debug("Could not salvage truncated JSON response")
+        return None
+
+
+def _parse_json_response(raw: str) -> dict | None:
+    """
+    Parse a JSON object from a Claude API response, handling common
+    noise: markdown fences, trailing commentary, whitespace.
+
+    Returns the parsed dict, or None if no valid JSON could be extracted.
+
+    Parsing strategy (in order):
+    1. Strip markdown fences and whitespace.
+    2. Return None for empty / null / trivially empty responses.
+    3. Try json.loads() on the full text.
+    4. Fall back to raw_decode() at the first '{' — log at DEBUG.
+    5. Fall back to brace-matching (first '{' to last '}') — log at WARNING.
+    6. Return None on total failure.
+    """
+    text = raw.strip()
+
+    # Strip markdown fences
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+
+    # Empty / trivial
+    if not text or text in ("{}", "[]", "null"):
+        return None
+
+    # Strategy 1: direct parse
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 2: raw_decode from first '{'
+    start = text.find("{")
+    if start != -1:
+        try:
+            decoder = json.JSONDecoder()
+            obj, _ = decoder.raw_decode(text, start)
+            log.debug("Parsed JSON via raw_decode (response had extra data)")
+            return obj
+        except json.JSONDecodeError:
+            pass
+
+        # Strategy 3: brace-matching (first '{' to last '}')
+        end = text.rfind("}")
+        if end != -1 and end > start:
+            try:
+                obj = json.loads(text[start:end + 1])
+                log.warning("Extracted JSON using brace matching")
+                return obj
+            except json.JSONDecodeError:
+                pass
+
+    log.error("Failed to parse JSON from Claude response. "
+              "First 500 chars: %s", text[:500])
+    return None
 
 
 def get_metric_mappings(
@@ -328,43 +546,75 @@ def get_metric_mappings(
     model = cfg["claude"]["model"]
     max_tokens = cfg["claude"]["max_tokens"]
     temperature = cfg["claude"]["temperature"]
+    use_thinking = "opus" in model.lower()
 
     prompt = MAPPING_PROMPT.format(
         proforma_data=proforma_data,
         memo_content=memo_content,
     )
 
-    log.info("Calling Claude API (model=%s, prompt=%d chars)...",
-             model, len(prompt))
+    log.info("Calling Claude API (model=%s, thinking=%s, prompt=%d chars)...",
+             model, use_thinking, len(prompt))
 
-    message = client.messages.create(
+    api_kwargs = dict(
         model=model,
         max_tokens=max_tokens,
-        temperature=temperature,
-        messages=[{"role": "user", "content": prompt}],
+        messages=[
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "{"},
+        ],
     )
+    if use_thinking:
+        api_kwargs["thinking"] = {"type": "adaptive"}
+        # Prefill is not compatible with thinking — remove it
+        api_kwargs["messages"] = [{"role": "user", "content": prompt}]
+    else:
+        api_kwargs["temperature"] = temperature
 
-    raw = message.content[0].text
+    message = client.messages.create(**api_kwargs)
+
+    # Extract text from response (skip thinking blocks)
+    raw = ""
+    for block in message.content:
+        if block.type == "text":
+            raw = block.text
+            break
+    # Restore the prefilled "{" for non-thinking models
+    if not use_thinking:
+        raw = "{" + raw
     log.info("Claude response received (%d chars, %s stop_reason)",
              len(raw), message.stop_reason)
 
     if message.stop_reason == "max_tokens":
-        log.error(
+        log.warning(
             "Claude's response was cut off (hit max_tokens=%d). "
-            "Increase max_tokens in config.yaml and retry.",
+            "Attempting to salvage partial entries...",
             max_tokens,
         )
-        sys.exit(1)
+        salvaged = _salvage_truncated_json(raw)
+        if salvaged is not None:
+            n = len(salvaged["table_updates"]) + len(salvaged["text_updates"])
+            log.info("Salvaged %d updates from truncated response", n)
+            salvaged["_truncated"] = True
+            return salvaged
+        else:
+            log.warning("Could not salvage truncated response — "
+                        "caller will retry with smaller chunks")
+            return {"table_updates": [], "text_updates": [], "_truncated": True}
 
-    # Parse JSON — handle optional markdown fences
-    text = raw.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
+    # Parse JSON using consolidated helper
+    empty_mappings = {"table_updates": [], "text_updates": []}
+    mappings = _parse_json_response(raw)
+    if mappings is None:
+        log.info("Claude returned empty/unparseable response — no updates for this batch")
+        return empty_mappings
 
-    mappings = json.loads(text)
-    n_table = len(mappings.get("table_updates", []))
-    n_text = len(mappings.get("text_updates", []))
+    # Ensure expected keys exist
+    mappings.setdefault("table_updates", [])
+    mappings.setdefault("text_updates", [])
+
+    n_table = len(mappings["table_updates"])
+    n_text = len(mappings["text_updates"])
     log.info("Parsed mappings: %d table updates, %d text updates", n_table, n_text)
     return mappings
 
@@ -374,9 +624,10 @@ def get_metric_mappings(
 # ============================================================================
 VALIDATION_PROMPT = """\
 You are a QA reviewer for financial document updates. You have been given a
-list of proposed changes to an IC memo. Your job is to validate them.
+list of proposed changes (numbered by index) to an IC memo. Your job is to
+find ONLY the problems — do NOT echo back entries that are correct.
 
-## Proposed Changes (JSON)
+## Proposed Changes (JSON, each entry has an "idx" field)
 {mappings_json}
 
 ## Original Memo Content
@@ -394,19 +645,25 @@ Review each proposed update and check:
 4. Are there any DUPLICATE updates (same cell targeted twice)?
 5. Are there any metrics in the memo that were MISSED?
 
+IMPORTANT: Only return entries that FAIL validation or are MISSED.
+Entries not mentioned are assumed to pass. This keeps the response compact.
+
 Return ONLY valid JSON (no markdown fences) matching this schema:
 
 {{
-  "validated_table_updates": [
-    ... same schema as table_updates, only include entries that pass validation ...
-  ],
-  "validated_text_updates": [
-    ... same schema as text_updates, only include entries that pass validation ...
-  ],
   "rejected": [
     {{
-      "original": {{ ... the rejected entry ... }},
+      "idx": <int, the index of the rejected entry>,
+      "type": "table" or "text",
       "reason": "<why it was rejected>"
+    }}
+  ],
+  "corrections": [
+    {{
+      "idx": <int, the index of the entry to correct>,
+      "type": "table" or "text",
+      "corrected_entry": {{ ... the full corrected entry ... }},
+      "reason": "<what was wrong and how it was fixed>"
     }}
   ],
   "missed": [
@@ -418,9 +675,84 @@ Return ONLY valid JSON (no markdown fences) matching this schema:
   ]
 }}
 
+If everything passes validation, return: {{"rejected": [], "corrections": [], "missed": []}}
+
 Be strict: reject any update where old_value does not exactly match the memo,
 or where the new_value formatting is inconsistent with the memo's style.
 """
+
+
+def _call_validation_api(
+    client: anthropic.Anthropic,
+    indexed_mappings: dict,
+    proforma_data: str,
+    memo_content: str,
+    cfg: dict,
+) -> dict:
+    """
+    Single validation API call. Returns the parsed JSON result from Claude.
+    Extracted as a helper so validate_mappings can batch multiple calls.
+    Uses validation_model (defaults to same as mapping model if not set).
+    """
+    model = cfg["claude"].get("validation_model", cfg["claude"]["model"])
+    max_tokens = cfg["claude"]["max_tokens"]
+    temperature = cfg["claude"]["temperature"]
+    use_thinking = "opus" in model.lower()
+
+    prompt = VALIDATION_PROMPT.format(
+        mappings_json=json.dumps(indexed_mappings, indent=2),
+        memo_content=memo_content,
+        proforma_data=proforma_data,
+    )
+
+    log.info("Calling Claude API for validation (model=%s, thinking=%s, "
+             "prompt=%d chars)...", model, use_thinking, len(prompt))
+
+    api_kwargs = dict(
+        model=model,
+        max_tokens=max_tokens,
+        messages=[
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "{"},
+        ],
+    )
+    if use_thinking:
+        api_kwargs["thinking"] = {"type": "adaptive"}
+        # Prefill is not compatible with thinking — remove it
+        api_kwargs["messages"] = [{"role": "user", "content": prompt}]
+    else:
+        api_kwargs["temperature"] = temperature
+
+    message = client.messages.create(**api_kwargs)
+
+    # Extract text from response (skip thinking blocks)
+    raw = ""
+    for block in message.content:
+        if block.type == "text":
+            raw = block.text
+            break
+    # Restore the prefilled "{" for non-thinking models
+    if not use_thinking:
+        raw = "{" + raw
+    log.info("Validation response received (%d chars, %s stop_reason)",
+             len(raw), message.stop_reason)
+
+    if message.stop_reason == "max_tokens":
+        log.warning(
+            "Claude's validation response was cut off (hit max_tokens=%d). "
+            "This batch will pass through unvalidated.",
+            max_tokens,
+        )
+        return {"rejected": [], "corrections": [], "missed": []}
+
+    # Parse JSON using consolidated helper
+    empty_result = {"rejected": [], "corrections": [], "missed": []}
+    result = _parse_json_response(raw)
+    if result is None:
+        log.info("Validation returned empty/unparseable response — all entries pass")
+        return empty_result
+
+    return result
 
 
 def validate_mappings(
@@ -434,73 +766,257 @@ def validate_mappings(
     Second Claude API call — validates the proposed mappings by cross-checking
     old values against the memo and new values against the proforma.
 
+    The prompt asks Claude to return ONLY rejections, corrections, and missed
+    entries (not all valid entries), keeping the response compact and well
+    within token limits. Valid entries are inferred by exclusion.
+
+    For large decks, batches the validation by page groups (same threshold
+    as the mapping step) so the prompt stays within model limits.
+
     Returns a validated/cleaned version of the mappings with rejected entries
     removed and any missed metrics flagged.
     """
-    model = cfg["claude"]["model"]
-    max_tokens = cfg["claude"]["max_tokens"]
-    temperature = cfg["claude"]["temperature"]
+    BATCH_THRESHOLD = 80_000  # chars; same as mapping step
+    RATE_LIMIT_INTERVAL = 65  # seconds between API calls
 
-    prompt = VALIDATION_PROMPT.format(
-        mappings_json=json.dumps(mappings, indent=2),
-        memo_content=memo_content,
-        proforma_data=proforma_data,
-    )
+    # Add idx to each entry so Claude can reference them by index
+    table_updates = mappings.get("table_updates", [])
+    text_updates = mappings.get("text_updates", [])
+    indexed_mappings = {
+        "table_updates": [
+            {**entry, "idx": i} for i, entry in enumerate(table_updates)
+        ],
+        "text_updates": [
+            {**entry, "idx": i} for i, entry in enumerate(text_updates)
+        ],
+    }
 
-    log.info("Calling Claude API for validation pass (prompt=%d chars)...", len(prompt))
+    prompt_size = (len(proforma_data) + len(memo_content)
+                   + len(json.dumps(indexed_mappings)))
 
-    message = client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    if prompt_size > BATCH_THRESHOLD:
+        # Batch by page groups — split memo into chunks and only send
+        # the mappings relevant to each chunk's pages.
+        log.info("Large validation prompt (%d chars) — batching by page groups",
+                 prompt_size)
+        memo_chunks = chunk_memo_by_pages(memo_content, pages_per_chunk=5)
 
-    raw = message.content[0].text
-    log.info("Validation response received (%d chars, %s stop_reason)",
-             len(raw), message.stop_reason)
+        # Determine which pages each chunk covers
+        merged_result = {"rejected": [], "corrections": [], "missed": []}
+        last_api_call = 0
+        for ci, chunk in enumerate(memo_chunks, 1):
+            # Extract page numbers from this chunk
+            chunk_pages = set(
+                int(m) for m in re.findall(r"PAGE (\d+)", chunk)
+            )
 
-    if message.stop_reason == "max_tokens":
-        log.error(
-            "Claude's validation response was cut off (hit max_tokens=%d). "
-            "Increase max_tokens in config.yaml and retry.",
-            max_tokens,
+            # Filter mappings to only entries for pages in this chunk
+            chunk_indexed = {
+                "table_updates": [
+                    e for e in indexed_mappings["table_updates"]
+                    if e.get("page") in chunk_pages
+                ],
+                "text_updates": [
+                    e for e in indexed_mappings["text_updates"]
+                    if e.get("page") in chunk_pages
+                ],
+            }
+
+            n_entries = (len(chunk_indexed["table_updates"])
+                         + len(chunk_indexed["text_updates"]))
+            if n_entries == 0:
+                log.info("Validation batch %d/%d: no mappings for pages %s — skipping",
+                         ci, len(memo_chunks), sorted(chunk_pages))
+                continue
+
+            if ci > 1 and last_api_call > 0:
+                elapsed = time.time() - last_api_call
+                wait = RATE_LIMIT_INTERVAL - elapsed
+                if wait > 0:
+                    log.info("Rate limit: waiting %.0f seconds...", wait)
+                    time.sleep(wait)
+
+            log.info("Validation batch %d/%d (%d entries, pages %s)...",
+                     ci, len(memo_chunks), n_entries, sorted(chunk_pages))
+            last_api_call = time.time()
+            batch_result = _call_validation_api(
+                client, chunk_indexed, proforma_data, chunk, cfg,
+            )
+            merged_result["rejected"].extend(batch_result.get("rejected", []))
+            merged_result["corrections"].extend(batch_result.get("corrections", []))
+            merged_result["missed"].extend(batch_result.get("missed", []))
+
+        result = merged_result
+    else:
+        result = _call_validation_api(
+            client, indexed_mappings, proforma_data, memo_content, cfg,
         )
-        sys.exit(1)
 
-    text = raw.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
+    # Reconstruct validated mappings: start with originals, remove rejections,
+    # apply corrections
+    rejected_table_idxs = set()
+    rejected_text_idxs = set()
+    correction_table = {}
+    correction_text = {}
 
-    result = json.loads(text)
+    for rej in result.get("rejected", []):
+        idx = rej.get("idx")
+        if idx is not None:
+            if rej.get("type") == "text":
+                rejected_text_idxs.add(idx)
+            else:
+                rejected_table_idxs.add(idx)
 
-    n_valid_table = len(result.get("validated_table_updates", []))
-    n_valid_text = len(result.get("validated_text_updates", []))
+    for cor in result.get("corrections", []):
+        idx = cor.get("idx")
+        if idx is not None:
+            if cor.get("type") == "text":
+                correction_text[idx] = cor["corrected_entry"]
+            else:
+                correction_table[idx] = cor["corrected_entry"]
+
+    valid_table = []
+    for i, entry in enumerate(table_updates):
+        if i in rejected_table_idxs:
+            continue
+        if i in correction_table:
+            valid_table.append(correction_table[i])
+        else:
+            valid_table.append(entry)
+
+    valid_text = []
+    for i, entry in enumerate(text_updates):
+        if i in rejected_text_idxs:
+            continue
+        if i in correction_text:
+            valid_text.append(correction_text[i])
+        else:
+            valid_text.append(entry)
+
     n_rejected = len(result.get("rejected", []))
+    n_corrections = len(result.get("corrections", []))
     n_missed = len(result.get("missed", []))
-    log.info("Validation: %d table, %d text validated | %d rejected | %d missed",
-             n_valid_table, n_valid_text, n_rejected, n_missed)
+    log.info("Validation: %d passed, %d rejected, %d corrected, %d missed",
+             len(valid_table) + len(valid_text), n_rejected, n_corrections, n_missed)
 
     if n_rejected > 0:
         for rej in result["rejected"]:
-            log.warning("  REJECTED: %s", rej.get("reason", "unknown"))
+            log.warning("  REJECTED idx=%s: %s", rej.get("idx", "?"),
+                        rej.get("reason", "unknown"))
+    if n_corrections > 0:
+        for cor in result["corrections"]:
+            log.warning("  CORRECTED idx=%s: %s", cor.get("idx", "?"),
+                        cor.get("reason", "unknown"))
     if n_missed > 0:
         for miss in result["missed"]:
             log.warning("  MISSED: page %s — %s", miss.get("page", "?"),
                         miss.get("description", ""))
 
-    # Return the validated mappings in the standard format
+    # Build rejected list for change log (include full original entries)
+    rejected_entries = []
+    for rej in result.get("rejected", []):
+        idx = rej.get("idx")
+        entry_type = rej.get("type", "table")
+        original = {}
+        if entry_type == "text" and idx is not None and idx < len(text_updates):
+            original = text_updates[idx]
+        elif idx is not None and idx < len(table_updates):
+            original = table_updates[idx]
+        rejected_entries.append({
+            "original": original,
+            "reason": rej.get("reason", "unknown"),
+        })
+
     return {
-        "table_updates": result.get("validated_table_updates", []),
-        "text_updates": result.get("validated_text_updates", []),
-        "rejected": result.get("rejected", []),
+        "table_updates": valid_table,
+        "text_updates": valid_text,
+        "rejected": rejected_entries,
         "missed": result.get("missed", []),
     }
 
 
 # ============================================================================
-# 8. APPLY TEXT / TABLE UPDATES  (python-pptx)
+# 8. PRE-VALIDATION (local Python check)
+# ============================================================================
+def pre_validate_mappings(mappings: dict, memo_content: str) -> dict:
+    """
+    Quick local check: verify each old_value / old_text actually exists in the
+    memo content. Reject entries that don't match. This catches the most common
+    Claude errors instantly without an API call.
+
+    Returns a new mappings dict with non-matching entries moved to 'rejected'.
+    """
+    def _split_memo_by_page(content: str) -> dict:
+        """
+        Build a {page_number: page_text_block} map from extracted memo content.
+        """
+        blocks = {}
+        page_headers = list(re.finditer(
+            r"={60,}\nPAGE\s+(\d+)[^\n]*\n={60,}",
+            content,
+        ))
+        if not page_headers:
+            return blocks
+
+        for i, m in enumerate(page_headers):
+            page_num = int(m.group(1))
+            start = m.start()
+            end = page_headers[i + 1].start() if i + 1 < len(page_headers) else len(content)
+            blocks[page_num] = content[start:end]
+        return blocks
+
+    page_blocks = _split_memo_by_page(memo_content)
+    valid_table = []
+    valid_text = []
+    rejected = list(mappings.get("rejected", []))
+
+    for upd in mappings.get("table_updates", []):
+        page = upd.get("page")
+        haystack = page_blocks.get(page, memo_content)
+        old_value = upd.get("old_value", "")
+        if old_value and old_value in haystack:
+            valid_table.append(upd)
+        else:
+            rejected.append({
+                "original": upd,
+                "reason": (
+                    f"old_value not found on page {page}: '{old_value}'"
+                    if page in page_blocks
+                    else f"old_value not found in memo: '{old_value}'"
+                ),
+            })
+
+    for upd in mappings.get("text_updates", []):
+        page = upd.get("page")
+        haystack = page_blocks.get(page, memo_content)
+        old_text = upd.get("old_text", "")
+        if old_text and old_text in haystack:
+            valid_text.append(upd)
+        else:
+            rejected.append({
+                "original": upd,
+                "reason": (
+                    f"old_text not found on page {page}: '{old_text}'"
+                    if page in page_blocks
+                    else f"old_text not found in memo: '{old_text}'"
+                ),
+            })
+
+    n_rejected_new = (len(rejected) - len(mappings.get("rejected", [])))
+    if n_rejected_new > 0:
+        log.warning("Pre-validation rejected %d entries (old value not in memo)",
+                    n_rejected_new)
+
+    return {
+        "table_updates": valid_table,
+        "text_updates": valid_text,
+        "rejected": rejected,
+        "missed": mappings.get("missed", []),
+    }
+
+
+# ============================================================================
+# 9. APPLY TEXT / TABLE UPDATES  (python-pptx)
 # ============================================================================
 def _replace_in_para(para, old_text: str, new_text: str) -> bool:
     """
@@ -554,6 +1070,73 @@ def _replace_in_shape(shape, old_text: str, new_text: str) -> bool:
     return False
 
 
+def _normalize_for_match(text: str) -> str:
+    """Normalize text for robust table/row matching."""
+    return re.sub(r"\s+", " ", (text or "").strip()).lower()
+
+
+def _loose_match(expected: str, actual: str) -> bool:
+    """
+    True when expected roughly matches actual (exact or containment after
+    whitespace/case normalization).
+    """
+    e = _normalize_for_match(expected)
+    a = _normalize_for_match(actual)
+    if not e:
+        return True
+    if not a:
+        return False
+    return e == a or e in a or a in e
+
+
+def _find_table_target(slide, table_name: str, row_label: str,
+                       col_idx: int, old_value: str):
+    """
+    Find the best target cell for a table update.
+    Preference order:
+    1) Tables matching table_name
+    2) Rows matching row_label
+    3) Cells containing old_value
+
+    Returns:
+      (shape, row_label_actual, cell) on success, or
+      (None, row_label_actual, cell_text) for diagnostics.
+    """
+    tables = [s for s in slide.shapes if s.has_table]
+    if not tables:
+        return None, None, None
+
+    if table_name:
+        preferred = [s for s in tables if _loose_match(table_name, s.name)]
+        fallback = [s for s in tables if s not in preferred]
+        ordered_groups = [preferred, fallback] if preferred else [tables]
+    else:
+        ordered_groups = [tables]
+
+    diagnostic_row = None
+    diagnostic_cell = None
+
+    for group in ordered_groups:
+        for shape in group:
+            for row in shape.table.rows:
+                if col_idx >= len(row.cells):
+                    continue
+                row_head = row.cells[0].text.strip() if row.cells else ""
+                if row_label and not _loose_match(row_label, row_head):
+                    continue
+
+                cell = row.cells[col_idx]
+                cell_text = cell.text or ""
+                if old_value in cell_text:
+                    return shape, row_head, cell
+
+                if diagnostic_row is None:
+                    diagnostic_row = row_head
+                    diagnostic_cell = cell_text
+
+    return None, diagnostic_row, diagnostic_cell
+
+
 def apply_updates(memo_path: str, mappings: dict, dry_run: bool = False) -> list:
     """
     Open the memo, apply every table_update and text_update from the
@@ -572,36 +1155,38 @@ def apply_updates(memo_path: str, mappings: dict, dry_run: bool = False) -> list
         source = upd.get("source", "")
         row_label = upd.get("row_label", "")
 
-        slide = prs.slides[page - 1]
-        found = False
-        for shape in slide.shapes:
-            if not shape.has_table:
-                continue
-            # Match by table name if provided, else try all tables
-            if tbl_name and shape.name != tbl_name:
-                continue
-            for row in shape.table.rows:
-                # Match by row label
-                r0 = row.cells[0].text.strip()
-                if row_label and row_label not in r0:
-                    continue
-                cell = row.cells[col_idx]
-                if old_val in cell.text:
-                    if not dry_run:
-                        _replace_in_cell(cell, old_val, new_val)
-                    changes.append({
-                        "page": page, "type": "table",
-                        "location": f"{tbl_name} / {row_label} / col {col_idx}",
-                        "old": old_val, "new": new_val, "source": source,
-                    })
-                    found = True
-                    break
-            if found:
-                break
+        try:
+            slide = prs.slides[page - 1]
+        except IndexError:
+            log.warning("Table update SKIPPED: page %d does not exist", page)
+            continue
+        shape, matched_row_label, cell_or_text = _find_table_target(
+            slide, tbl_name, row_label, col_idx, old_val
+        )
+        if shape is not None:
+            if not dry_run:
+                _replace_in_cell(cell_or_text, old_val, new_val)
+            location_table = shape.name or tbl_name or "<unnamed table>"
+            location_row = matched_row_label or row_label or "<unknown row>"
+            changes.append({
+                "page": page, "type": "table",
+                "location": f"{location_table} / {location_row} / col {col_idx}",
+                "old": old_val, "new": new_val, "source": source,
+            })
+            continue
 
-        if not found:
-            log.warning("Table update NOT FOUND: page %d, '%s' -> '%s'",
-                        page, old_val, new_val)
+        if matched_row_label is not None:
+            log.warning(
+                "Table update NOT FOUND: page %d, '%s' -> '%s' "
+                "(closest row '%s' col %d has '%s')",
+                page, old_val, new_val, matched_row_label, col_idx, cell_or_text
+            )
+        else:
+            log.warning(
+                "Table update NOT FOUND: page %d, '%s' -> '%s' "
+                "(no matching table/row for table_name='%s' row_label='%s')",
+                page, old_val, new_val, tbl_name, row_label
+            )
 
     # --- Text (narrative) updates ---
     for upd in mappings.get("text_updates", []):
@@ -610,25 +1195,36 @@ def apply_updates(memo_path: str, mappings: dict, dry_run: bool = False) -> list
         new_txt = upd["new_text"]
         source = upd.get("source", "")
 
-        slide = prs.slides[page - 1]
+        try:
+            slide = prs.slides[page - 1]
+        except IndexError:
+            log.warning("Text update SKIPPED: page %d does not exist", page)
+            continue
         found = False
         for shape in slide.shapes:
-            if shape.has_text_frame:
-                for para in shape.text_frame.paragraphs:
-                    if old_txt in para.text:
-                        if not dry_run:
-                            for run in para.runs:
-                                if old_txt in run.text:
-                                    run.text = run.text.replace(old_txt, new_txt)
-                        changes.append({
-                            "page": page, "type": "text",
-                            "location": shape.name,
-                            "old": old_txt, "new": new_txt, "source": source,
-                        })
-                        found = True
-                        break
-            if found:
-                break
+            if not dry_run:
+                if _replace_in_shape(shape, old_txt, new_txt):
+                    changes.append({
+                        "page": page, "type": "text",
+                        "location": shape.name,
+                        "old": old_txt, "new": new_txt, "source": source,
+                    })
+                    found = True
+                    break
+            else:
+                # Dry-run: check if the text exists without modifying
+                if shape.has_text_frame:
+                    for para in shape.text_frame.paragraphs:
+                        if old_txt in para.text:
+                            changes.append({
+                                "page": page, "type": "text",
+                                "location": shape.name,
+                                "old": old_txt, "new": new_txt, "source": source,
+                            })
+                            found = True
+                            break
+                if found:
+                    break
 
         if not found:
             log.warning("Text update NOT FOUND: page %d, '%s' -> '%s'",
@@ -644,15 +1240,18 @@ def apply_updates(memo_path: str, mappings: dict, dry_run: bool = False) -> list
 
 
 # ============================================================================
-# 9. CHANGE LOG
+# 10. CHANGE LOG
 # ============================================================================
 def write_change_log(output_dir: str, all_changes: list, mappings: dict,
                      memo_path: str, proforma_path: str, backup_path: str):
     """Write a Markdown change-log summarizing every modification."""
+    def _md_cell(value: str) -> str:
+        return str(value).replace("|", "\\|").replace("\n", "<br>")
+
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_path = os.path.join(output_dir, "CHANGE_LOG.md")
 
-    with open(log_path, "w") as f:
+    with open(log_path, "w", encoding="utf-8") as f:
         f.write("# Memo Automator - Change Log\n\n")
         f.write(f"**Run date:** {ts}\n\n")
         f.write(f"**Memo:** `{os.path.basename(memo_path)}`\n\n")
@@ -667,8 +1266,8 @@ def write_change_log(output_dir: str, all_changes: list, mappings: dict,
             old_display = c['old'][:40] + "..." if len(c['old']) > 40 else c['old']
             new_display = c['new'][:40] + "..." if len(c['new']) > 40 else c['new']
             f.write(f"| {i} | {c['page']} | {c['type']} | "
-                    f"{c['location']} | {old_display} | {new_display} | "
-                    f"{c['source']} |\n")
+                    f"{_md_cell(c['location'])} | {_md_cell(old_display)} | "
+                    f"{_md_cell(new_display)} | {_md_cell(c['source'])} |\n")
 
         # Rejected updates
         rejected = mappings.get("rejected", [])
@@ -701,7 +1300,7 @@ def write_change_log(output_dir: str, all_changes: list, mappings: dict,
 
 
 # ============================================================================
-# 10. MAIN
+# 11. MAIN
 # ============================================================================
 def main():
     args = parse_args()
@@ -732,8 +1331,14 @@ def main():
     output_dir = args.output_dir or os.path.dirname(os.path.abspath(args.memo))
     os.makedirs(output_dir, exist_ok=True)
 
-    # Initialize Claude client (used for both mapping and validation)
-    client = anthropic.Anthropic(api_key=api_key)
+    # Initialize Claude client (shared for mapping + validation)
+    log.info("Mapping model: %s  |  Validation model: %s",
+             cfg["claude"]["model"], cfg["claude"]["validation_model"])
+    client = anthropic.Anthropic(
+        api_key=api_key,
+        max_retries=5,
+        timeout=900.0,  # 15 min — needed for large batches and Opus thinking
+    )
 
     # ---- Step 1: Backup ----
     log.info("=" * 60)
@@ -773,20 +1378,79 @@ def main():
     log.info("=" * 60)
     log.info("STEP 4: Claude API — identifying metric mappings")
     log.info("=" * 60)
-    BATCH_THRESHOLD = 120_000  # chars; above this, process slides in batches
+    BATCH_THRESHOLD = 80_000  # chars; above this, process slides in batches
+    RATE_LIMIT_INTERVAL = 65  # seconds between API calls for rate limiting
     prompt_size = len(proforma_data) + len(memo_content)
     if prompt_size > BATCH_THRESHOLD:
-        log.info("Large prompt (%d chars) — processing slides in batches of 10",
+        log.info("Large prompt (%d chars) — processing slides in batches of 3",
                  prompt_size)
-        memo_chunks = chunk_memo_by_pages(memo_content, pages_per_chunk=10)
+        memo_chunks = chunk_memo_by_pages(memo_content, pages_per_chunk=3)
         mappings = {"table_updates": [], "text_updates": []}
+        last_api_call = 0
         for i, chunk in enumerate(memo_chunks, 1):
+            if i > 1 and last_api_call > 0:
+                elapsed = time.time() - last_api_call
+                wait = RATE_LIMIT_INTERVAL - elapsed
+                if wait > 0:
+                    log.info("Rate limit: waiting %.0f seconds (%.0fs elapsed since last call)...",
+                             wait, elapsed)
+                    time.sleep(wait)
+                else:
+                    log.info("Rate limit: no wait needed (%.0fs elapsed since last call)",
+                             elapsed)
             log.info("Mapping batch %d / %d ...", i, len(memo_chunks))
+            last_api_call = time.time()
             batch = get_metric_mappings(client, proforma_data, chunk, cfg)
-            mappings["table_updates"].extend(batch.get("table_updates", []))
-            mappings["text_updates"].extend(batch.get("text_updates", []))
+
+            # --- Retry truncated batches with single-page sub-chunks ---
+            if batch.pop("_truncated", False):
+                # Collect pages already covered by salvaged entries
+                covered_pages = set()
+                for e in batch.get("table_updates", []):
+                    covered_pages.add(e.get("page"))
+                for e in batch.get("text_updates", []):
+                    covered_pages.add(e.get("page"))
+                # Keep whatever was salvaged
+                mappings["table_updates"].extend(batch.get("table_updates", []))
+                mappings["text_updates"].extend(batch.get("text_updates", []))
+
+                log.info("Retrying truncated batch %d with single-page sub-chunks "
+                         "(covered pages so far: %s)", i, sorted(covered_pages))
+                sub_chunks = chunk_memo_by_pages(chunk, pages_per_chunk=1)
+                for j, sub_chunk in enumerate(sub_chunks, 1):
+                    sub_pages = set(
+                        int(m) for m in re.findall(r"PAGE (\d+)", sub_chunk)
+                    )
+                    if sub_pages and sub_pages.issubset(covered_pages):
+                        log.info("  Sub-chunk %d/%d (pages %s) already covered — skipping",
+                                 j, len(sub_chunks), sorted(sub_pages))
+                        continue
+
+                    elapsed = time.time() - last_api_call
+                    wait = RATE_LIMIT_INTERVAL - elapsed
+                    if wait > 0:
+                        log.info("Rate limit: waiting %.0f seconds...", wait)
+                        time.sleep(wait)
+
+                    log.info("  Sub-chunk %d/%d (pages %s)...",
+                             j, len(sub_chunks), sorted(sub_pages))
+                    last_api_call = time.time()
+                    sub_batch = get_metric_mappings(
+                        client, proforma_data, sub_chunk, cfg,
+                    )
+                    if sub_batch.pop("_truncated", False):
+                        log.warning("  Sub-chunk %d still truncated after single-page "
+                                    "retry — moving on", j)
+                    mappings["table_updates"].extend(
+                        sub_batch.get("table_updates", []))
+                    mappings["text_updates"].extend(
+                        sub_batch.get("text_updates", []))
+            else:
+                mappings["table_updates"].extend(batch.get("table_updates", []))
+                mappings["text_updates"].extend(batch.get("text_updates", []))
     else:
         mappings = get_metric_mappings(client, proforma_data, memo_content, cfg)
+        mappings.pop("_truncated", None)
 
     # Save raw mappings for audit
     map_dump = os.path.join(output_dir, "mappings_raw.json")
@@ -794,14 +1458,41 @@ def main():
         json.dump(mappings, f, indent=2)
     log.info("Raw mappings saved to %s", map_dump)
 
+    # ---- Step 4a: Strip no-op entries (old == new) ----
+    pre_table = len(mappings["table_updates"])
+    pre_text = len(mappings["text_updates"])
+    mappings["table_updates"] = [
+        e for e in mappings["table_updates"]
+        if e.get("old_value") != e.get("new_value")
+    ]
+    mappings["text_updates"] = [
+        e for e in mappings["text_updates"]
+        if e.get("old_text") != e.get("new_text")
+    ]
+    n_stripped = (pre_table - len(mappings["table_updates"])
+                  + pre_text - len(mappings["text_updates"]))
+    if n_stripped > 0:
+        log.info("Stripped %d no-op entries (old == new)", n_stripped)
+
+    # ---- Step 4b: Pre-validation (local Python check) ----
+    mappings = pre_validate_mappings(mappings, memo_content)
+
     # ---- Step 5: Claude API — validation pass (QA reasoning step) ----
     # Second API call: Claude cross-checks the proposed updates to catch
     # errors — wrong old_value text, formatting mismatches, duplicates,
     # or missed metrics. This replaces human review of the mapping output.
-    log.info("=" * 60)
-    log.info("STEP 5: Claude API — validating mappings")
-    log.info("=" * 60)
-    validated = validate_mappings(client, mappings, proforma_data, memo_content, cfg)
+    if args.skip_validation:
+        log.info("=" * 60)
+        log.info("STEP 5: SKIPPED (--skip-validation flag)")
+        log.info("=" * 60)
+        validated = mappings
+        validated.setdefault("rejected", [])
+        validated.setdefault("missed", [])
+    else:
+        log.info("=" * 60)
+        log.info("STEP 5: Claude API — validating mappings")
+        log.info("=" * 60)
+        validated = validate_mappings(client, mappings, proforma_data, memo_content, cfg)
 
     # Save validated mappings for audit
     val_dump = os.path.join(output_dir, "mappings_validated.json")
