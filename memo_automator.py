@@ -79,6 +79,11 @@ def parse_args():
         action="store_true",
         help="Skip the Claude validation pass for faster runs",
     )
+    p.add_argument(
+        "--property-name",
+        default="",
+        help="Property name as shown in the proforma (helps match rebranded names)",
+    )
     return p.parse_args()
 
 
@@ -320,8 +325,36 @@ metric in the memo that should be updated with new values from the proforma.
    name differs from the memo, update every occurrence in both tables and
    narrative text to match the proforma.
 
-Return ONLY valid JSON (no markdown fences, no commentary) matching this
-schema exactly:
+7. **IRR selection** — When the executive summary or other sections reference
+   an IRR, use the **3-year IRR** from the proforma, NOT the 4-year IRR,
+   unless the memo cell explicitly labels itself as a different horizon.
+
+8. **"Chunk rents" and untrended values** — When the memo refers to
+   "chunk rents per month" or simply "rents" without a trend qualifier,
+   it means today's **untrended** rents from the proforma.  Likewise,
+   "controllable OpEx per bed" and "OpEx ratio" default to **untrended**
+   values unless the memo explicitly says "trended."
+
+9. **Comp summary / comp rollup (row-oriented)** — The **top row** (first
+   data row) is always the subject property and MUST be updated from the
+   proforma.  If the name in that row differs from the proforma's property
+   name, replace it so the name matches the proforma.
+
+10. **Pipeline table** — Same rule: the **top row** is the subject property.
+    Update all its metrics and swap its name to match the proforma if they
+    differ.
+
+11. **Underwriting projections / end-of-memo tables** — Pages near the end
+    of the memo that contain tables WITHOUT narrative text (pure data
+    tables under headings like "Underwriting Projections") MUST also be
+    updated.  Do NOT skip these pages — scan and update every metric that
+    has a proforma source.
+
+CRITICAL: Return ONLY the raw JSON object below. Do NOT include any analysis,
+reasoning, explanation, or commentary before or after the JSON. Your entire
+response must be parseable as JSON. Start with {{ and end with }}.
+
+Schema:
 
 {{
   "table_updates": [
@@ -356,7 +389,7 @@ Important:
   whose inputs have changed (totals, ratios, per-unit metrics, etc.).
 - Scan ALL pages including large data tables (e.g. executive summary,
   cash flow, unit mix, development budget tables that may span full pages).
-"""
+{property_name_section}"""
 
 
 def _salvage_truncated_json(raw: str) -> dict | None:
@@ -534,6 +567,7 @@ def get_metric_mappings(
     proforma_data: str,
     memo_content: str,
     cfg: dict,
+    property_name: str = "",
 ) -> dict:
     """
     Send proforma data + memo content to Claude and receive structured
@@ -548,9 +582,20 @@ def get_metric_mappings(
     temperature = cfg["claude"]["temperature"]
     use_thinking = "opus" in model.lower()
 
+    if property_name:
+        pn_section = (
+            f"\n## Property Name\n"
+            f"The current property name is \"{property_name}\". If the memo uses a "
+            f"different name (e.g. a prior project name), update ALL occurrences "
+            f"to match this name.\n"
+        )
+    else:
+        pn_section = ""
+
     prompt = MAPPING_PROMPT.format(
         proforma_data=proforma_data,
         memo_content=memo_content,
+        property_name_section=pn_section,
     )
 
     log.info("Calling Claude API (model=%s, thinking=%s, prompt=%d chars)...",
@@ -559,15 +604,10 @@ def get_metric_mappings(
     api_kwargs = dict(
         model=model,
         max_tokens=max_tokens,
-        messages=[
-            {"role": "user", "content": prompt},
-            {"role": "assistant", "content": "{"},
-        ],
+        messages=[{"role": "user", "content": prompt}],
     )
     if use_thinking:
         api_kwargs["thinking"] = {"type": "adaptive"}
-        # Prefill is not compatible with thinking — remove it
-        api_kwargs["messages"] = [{"role": "user", "content": prompt}]
     else:
         api_kwargs["temperature"] = temperature
 
@@ -579,9 +619,6 @@ def get_metric_mappings(
         if block.type == "text":
             raw = block.text
             break
-    # Restore the prefilled "{" for non-thinking models
-    if not use_thinking:
-        raw = "{" + raw
     log.info("Claude response received (%d chars, %s stop_reason)",
              len(raw), message.stop_reason)
 
@@ -606,8 +643,27 @@ def get_metric_mappings(
     empty_mappings = {"table_updates": [], "text_updates": []}
     mappings = _parse_json_response(raw)
     if mappings is None:
-        log.info("Claude returned empty/unparseable response — no updates for this batch")
-        return empty_mappings
+        # Retry once — Claude sometimes returns analysis text instead of JSON
+        log.warning("Claude returned non-JSON response — retrying with stricter prompt...")
+        retry_prompt = (
+            prompt
+            + "\n\nIMPORTANT: You MUST respond with ONLY the JSON object. "
+            "Do NOT include any analysis, explanation, or reasoning. "
+            "Start your response with { and end with }."
+        )
+        api_kwargs["messages"] = [{"role": "user", "content": retry_prompt}]
+        retry_msg = client.messages.create(**api_kwargs)
+        retry_raw = ""
+        for block in retry_msg.content:
+            if block.type == "text":
+                retry_raw = block.text
+                break
+        log.info("Retry response received (%d chars, %s stop_reason)",
+                 len(retry_raw), retry_msg.stop_reason)
+        mappings = _parse_json_response(retry_raw)
+        if mappings is None:
+            log.info("Retry also returned unparseable response — no updates for this batch")
+            return empty_mappings
 
     # Ensure expected keys exist
     mappings.setdefault("table_updates", [])
@@ -679,7 +735,18 @@ If everything passes validation, return: {{"rejected": [], "corrections": [], "m
 
 Be strict: reject any update where old_value does not exactly match the memo,
 or where the new_value formatting is inconsistent with the memo's style.
-"""
+
+Additional domain rules to enforce:
+- IRR values should use the **3-year IRR**, not 4-year, unless the cell
+  explicitly labels a different horizon. Flag if a 4-year IRR was used.
+- "Chunk rents", unqualified "rents per month", "controllable OpEx per bed",
+  and "OpEx ratio" all refer to **untrended** proforma values unless
+  explicitly labeled "trended." Correct any that used trended values.
+- The **top row** of comp summary/rollup and pipeline tables is the subject
+  property — it MUST be updated. Flag as missed if it was skipped.
+- End-of-memo data tables (underwriting projections pages with tables but
+  no narrative) MUST be updated. Flag as missed if skipped.
+{property_name_section}"""
 
 
 def _call_validation_api(
@@ -688,6 +755,7 @@ def _call_validation_api(
     proforma_data: str,
     memo_content: str,
     cfg: dict,
+    property_name: str = "",
 ) -> dict:
     """
     Single validation API call. Returns the parsed JSON result from Claude.
@@ -699,10 +767,20 @@ def _call_validation_api(
     temperature = cfg["claude"]["temperature"]
     use_thinking = "opus" in model.lower()
 
+    if property_name:
+        pn_section = (
+            f"\n## Property Name\n"
+            f"The current property name is \"{property_name}\". Verify that name "
+            f"updates correctly replace any prior project name with this one.\n"
+        )
+    else:
+        pn_section = ""
+
     prompt = VALIDATION_PROMPT.format(
         mappings_json=json.dumps(indexed_mappings, indent=2),
         memo_content=memo_content,
         proforma_data=proforma_data,
+        property_name_section=pn_section,
     )
 
     log.info("Calling Claude API for validation (model=%s, thinking=%s, "
@@ -711,15 +789,10 @@ def _call_validation_api(
     api_kwargs = dict(
         model=model,
         max_tokens=max_tokens,
-        messages=[
-            {"role": "user", "content": prompt},
-            {"role": "assistant", "content": "{"},
-        ],
+        messages=[{"role": "user", "content": prompt}],
     )
     if use_thinking:
         api_kwargs["thinking"] = {"type": "adaptive"}
-        # Prefill is not compatible with thinking — remove it
-        api_kwargs["messages"] = [{"role": "user", "content": prompt}]
     else:
         api_kwargs["temperature"] = temperature
 
@@ -731,9 +804,6 @@ def _call_validation_api(
         if block.type == "text":
             raw = block.text
             break
-    # Restore the prefilled "{" for non-thinking models
-    if not use_thinking:
-        raw = "{" + raw
     log.info("Validation response received (%d chars, %s stop_reason)",
              len(raw), message.stop_reason)
 
@@ -761,6 +831,7 @@ def validate_mappings(
     proforma_data: str,
     memo_content: str,
     cfg: dict,
+    property_name: str = "",
 ) -> dict:
     """
     Second Claude API call — validates the proposed mappings by cross-checking
@@ -841,6 +912,7 @@ def validate_mappings(
             last_api_call = time.time()
             batch_result = _call_validation_api(
                 client, chunk_indexed, proforma_data, chunk, cfg,
+                property_name=property_name,
             )
             merged_result["rejected"].extend(batch_result.get("rejected", []))
             merged_result["corrections"].extend(batch_result.get("corrections", []))
@@ -850,6 +922,7 @@ def validate_mappings(
     else:
         result = _call_validation_api(
             client, indexed_mappings, proforma_data, memo_content, cfg,
+            property_name=property_name,
         )
 
     # Reconstruct validated mappings: start with originals, remove rejections,
@@ -1058,14 +1131,47 @@ def _replace_in_cell(cell, old_text: str, new_text: str) -> bool:
     return False
 
 
+def _normalize_unicode(text: str) -> str:
+    """
+    Normalize Unicode characters that PowerPoint often substitutes:
+    non-breaking spaces -> spaces, smart quotes -> ASCII quotes,
+    en/em dashes -> hyphens, etc.
+    """
+    return (text
+            .replace("\u00a0", " ")    # non-breaking space
+            .replace("\u2013", "-")    # en dash
+            .replace("\u2014", "-")    # em dash
+            .replace("\u2018", "'")    # left single quote
+            .replace("\u2019", "'")    # right single quote
+            .replace("\u201c", '"')    # left double quote
+            .replace("\u201d", '"')    # right double quote
+            .replace("\u2502", "|")    # box drawing vertical
+            .replace("\uff5c", "|"))   # fullwidth vertical line
+
+
 def _replace_in_shape(shape, old_text: str, new_text: str) -> bool:
-    """Replace old_text in any text-frame shape, preserving formatting."""
+    """Replace old_text in any text-frame shape, preserving formatting.
+    Falls back to Unicode-normalized matching if exact match fails."""
     if not shape.has_text_frame:
         return False
+    # Pass 1: exact match
     for para in shape.text_frame.paragraphs:
         if old_text not in para.text:
             continue
         if _replace_in_para(para, old_text, new_text):
+            return True
+    # Pass 2: normalized match — find the actual text in the shape that
+    # corresponds to the normalized old_text, then replace that
+    norm_old = _normalize_unicode(old_text)
+    for para in shape.text_frame.paragraphs:
+        para_text = para.text
+        norm_para = _normalize_unicode(para_text)
+        if norm_old not in norm_para:
+            continue
+        # Find the actual substring in the original para text
+        idx = norm_para.find(norm_old)
+        actual_old = para_text[idx:idx + len(norm_old)]
+        if _replace_in_para(para, actual_old, new_text):
             return True
     return False
 
@@ -1075,10 +1181,19 @@ def _normalize_for_match(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip()).lower()
 
 
+def _strip_to_core(text: str) -> str:
+    """
+    Strip a label down to its alphanumeric core for bedroom-type matching.
+    '1BR/1BA' -> '1br1ba', '1 BR' -> '1br', '4BR/2BA' -> '4br2ba'
+    """
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
 def _loose_match(expected: str, actual: str) -> bool:
     """
     True when expected roughly matches actual (exact or containment after
-    whitespace/case normalization).
+    whitespace/case normalization), or when both start with the same
+    bedroom count (e.g. '1BR/1BA' matches '1 BR').
     """
     e = _normalize_for_match(expected)
     a = _normalize_for_match(actual)
@@ -1086,7 +1201,16 @@ def _loose_match(expected: str, actual: str) -> bool:
         return True
     if not a:
         return False
-    return e == a or e in a or a in e
+    if e == a or e in a or a in e:
+        return True
+    # Bedroom-label fallback: match on leading digit + "br"
+    ec = _strip_to_core(expected)
+    ac = _strip_to_core(actual)
+    br_pat = re.match(r"^(\d+)br", ec)
+    br_pat2 = re.match(r"^(\d+)br", ac)
+    if br_pat and br_pat2 and br_pat.group(1) == br_pat2.group(1):
+        return True
+    return False
 
 
 def _find_table_target(slide, table_name: str, row_label: str,
@@ -1094,9 +1218,10 @@ def _find_table_target(slide, table_name: str, row_label: str,
     """
     Find the best target cell for a table update.
     Preference order:
-    1) Tables matching table_name
-    2) Rows matching row_label
-    3) Cells containing old_value
+    1) Tables matching table_name + rows matching row_label + cell has old_value
+    2) Any table + rows matching row_label + cell has old_value
+    3) Any table + ANY row where cell at col_idx has old_value (fallback)
+    4) Any table + ANY row + ANY column has old_value (last resort)
 
     Returns:
       (shape, row_label_actual, cell) on success, or
@@ -1116,6 +1241,7 @@ def _find_table_target(slide, table_name: str, row_label: str,
     diagnostic_row = None
     diagnostic_cell = None
 
+    # Pass 1: row_label match + old_value at col_idx
     for group in ordered_groups:
         for shape in group:
             for row in shape.table.rows:
@@ -1133,6 +1259,34 @@ def _find_table_target(slide, table_name: str, row_label: str,
                 if diagnostic_row is None:
                     diagnostic_row = row_head
                     diagnostic_cell = cell_text
+
+    # Pass 2: ignore row_label, find old_value at col_idx in any row
+    for group in ordered_groups:
+        for shape in group:
+            for row in shape.table.rows:
+                if col_idx >= len(row.cells):
+                    continue
+                cell = row.cells[col_idx]
+                cell_text = cell.text or ""
+                if old_value in cell_text:
+                    row_head = row.cells[0].text.strip() if row.cells else ""
+                    log.debug("Fallback match (ignoring row_label '%s'): "
+                              "found '%s' at row '%s' col %d",
+                              row_label, old_value, row_head, col_idx)
+                    return shape, row_head, cell
+
+    # Pass 3: ignore row_label AND col_idx, find old_value in any cell
+    for group in ordered_groups:
+        for shape in group:
+            for row in shape.table.rows:
+                for ci, cell in enumerate(row.cells):
+                    cell_text = cell.text or ""
+                    if old_value in cell_text:
+                        row_head = row.cells[0].text.strip() if row.cells else ""
+                        log.debug("Last-resort match: found '%s' at row '%s' "
+                                  "col %d (requested col %d)",
+                                  old_value, row_head, ci, col_idx)
+                        return shape, row_head, cell
 
     return None, diagnostic_row, diagnostic_cell
 
@@ -1400,7 +1554,8 @@ def main():
                              elapsed)
             log.info("Mapping batch %d / %d ...", i, len(memo_chunks))
             last_api_call = time.time()
-            batch = get_metric_mappings(client, proforma_data, chunk, cfg)
+            batch = get_metric_mappings(client, proforma_data, chunk, cfg,
+                                       property_name=args.property_name)
 
             # --- Retry truncated batches with single-page sub-chunks ---
             if batch.pop("_truncated", False):
@@ -1437,6 +1592,7 @@ def main():
                     last_api_call = time.time()
                     sub_batch = get_metric_mappings(
                         client, proforma_data, sub_chunk, cfg,
+                        property_name=args.property_name,
                     )
                     if sub_batch.pop("_truncated", False):
                         log.warning("  Sub-chunk %d still truncated after single-page "
@@ -1449,7 +1605,8 @@ def main():
                 mappings["table_updates"].extend(batch.get("table_updates", []))
                 mappings["text_updates"].extend(batch.get("text_updates", []))
     else:
-        mappings = get_metric_mappings(client, proforma_data, memo_content, cfg)
+        mappings = get_metric_mappings(client, proforma_data, memo_content, cfg,
+                                       property_name=args.property_name)
         mappings.pop("_truncated", None)
 
     # Save raw mappings for audit
@@ -1492,7 +1649,8 @@ def main():
         log.info("=" * 60)
         log.info("STEP 5: Claude API — validating mappings")
         log.info("=" * 60)
-        validated = validate_mappings(client, mappings, proforma_data, memo_content, cfg)
+        validated = validate_mappings(client, mappings, proforma_data, memo_content, cfg,
+                                      property_name=args.property_name)
 
     # Save validated mappings for audit
     val_dump = os.path.join(output_dir, "mappings_validated.json")
