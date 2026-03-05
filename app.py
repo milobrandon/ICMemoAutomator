@@ -1,25 +1,31 @@
 #!/usr/bin/env python3
 """Memo Chef — Streamlit dashboard wrapping memo_automator.py."""
 
+import hashlib
 import logging
 import os
 import re
-import shutil
+import secrets as _secrets
 import tempfile
 import time
+from datetime import datetime, timedelta
+
 
 import anthropic
+import psycopg2
 import streamlit as st
-from dotenv import load_dotenv
 
 from memo_automator import (
+    apply_branding,
     apply_updates,
     chunk_memo_by_pages,
     create_backup,
     extract_memo_content,
     extract_proforma_data,
+    extract_schedule_data,
     get_metric_mappings,
     load_config,
+    normalize_layout,
     pre_validate_mappings,
     validate_mappings,
     write_change_log,
@@ -29,6 +35,237 @@ from memo_automator import (
 # PAGE CONFIG
 # ============================================================================
 st.set_page_config(page_title="Memo Chef", page_icon="\U0001f9d1\u200d\U0001f373", layout="centered")
+
+# ============================================================================
+# SUBTEXT BRAND STYLING
+# ============================================================================
+st.markdown("""
+<style>
+    .stButton > button[kind="primary"], button[kind="primary"] {
+        background-color: #16352e !important;
+        border-color: #16352e !important;
+        color: #f7f1e3 !important;
+    }
+    .stButton > button[kind="primary"]:hover, button[kind="primary"]:hover {
+        background-color: #1e4a3f !important;
+        border-color: #1e4a3f !important;
+    }
+    .stButton > button:not([kind="primary"]), .stDownloadButton > button {
+        background-color: #e8dece !important;
+        border: 1px solid #2b2825 !important;
+        color: #2b2825 !important;
+    }
+    .stDownloadButton > button:hover, .stButton > button:not([kind="primary"]):hover {
+        background-color: #d9cab5 !important;
+    }
+    section[data-testid="stSidebar"] {
+        background-color: #2b2825 !important;
+    }
+    section[data-testid="stSidebar"] * {
+        color: #f7f1e3 !important;
+    }
+    section[data-testid="stSidebar"] .stProgress > div > div {
+        background-color: #c1d100 !important;
+    }
+    .stProgress > div > div > div {
+        background-color: #16352e !important;
+    }
+    [data-testid="stFileUploader"] { border-color: #a95818 !important; }
+    [data-testid="stFileUploader"] button { color: #16352e !important; border-color: #16352e !important; }
+    .streamlit-expanderHeader { color: #512213 !important; }
+    [data-testid="stMetricValue"] { color: #16352e !important; }
+    [data-testid="stStatusWidget"] { border-color: #a95818 !important; }
+    .stTextInput input:focus {
+        border-color: #16352e !important;
+        box-shadow: 0 0 0 1px #16352e !important;
+    }
+    .stForm button[kind="secondaryFormSubmit"] {
+        background-color: #16352e !important;
+        color: #f7f1e3 !important;
+        border-color: #16352e !important;
+    }
+    a { color: #a95818 !important; }
+    a:hover { color: #512213 !important; }
+    hr { border-color: #a95818 !important; }
+</style>
+""", unsafe_allow_html=True)
+
+# ============================================================================
+# PASSWORD HELPERS
+# ============================================================================
+def _hash_password(password: str, salt: bytes | None = None) -> str:
+    """Return ``"salt_hex:hash_hex"`` using PBKDF2-SHA256."""
+    if salt is None:
+        salt = _secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 260_000)
+    return f"{salt.hex()}:{dk.hex()}"
+
+
+def _verify_password(password: str, stored_hash: str) -> bool:
+    salt_hex, hash_hex = stored_hash.split(":", 1)
+    salt = bytes.fromhex(salt_hex)
+    candidate = _hash_password(password, salt)
+    return candidate == stored_hash
+
+
+# ============================================================================
+# CREDIT SYSTEM  (persistent Neon Postgres)
+# ============================================================================
+@st.cache_resource
+def _get_db_conn():
+    """Return a psycopg2 connection to the credits database (cached)."""
+    conn = psycopg2.connect(st.secrets["CREDITS_DATABASE_URL"])
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS credit_usage ("
+            "  username TEXT PRIMARY KEY,"
+            "  week TEXT NOT NULL,"
+            "  used INTEGER NOT NULL DEFAULT 0"
+            ")"
+        )
+    return conn
+
+
+def _current_week_start() -> str:
+    """ISO Monday date for the current week."""
+    today = datetime.now()
+    monday = today - timedelta(days=today.weekday())
+    return monday.strftime("%Y-%m-%d")
+
+
+def _get_user_credits(username: str, credits_per_week: int) -> tuple[int, int]:
+    """Return (used, remaining). Auto-resets on week rollover."""
+    conn = _get_db_conn()
+    week = _current_week_start()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT week, used FROM credit_usage WHERE username = %s",
+            (username,),
+        )
+        row = cur.fetchone()
+        if row is None or row[0] != week:
+            # New user or new week — upsert with reset
+            cur.execute(
+                "INSERT INTO credit_usage (username, week, used) VALUES (%s, %s, 0) "
+                "ON CONFLICT (username) DO UPDATE SET week = %s, used = 0",
+                (username, week, week),
+            )
+            return 0, credits_per_week
+        used = row[1]
+    return used, max(0, credits_per_week - used)
+
+
+def _consume_credit(username: str) -> None:
+    conn = _get_db_conn()
+    week = _current_week_start()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO credit_usage (username, week, used) VALUES (%s, %s, 1) "
+            "ON CONFLICT (username) DO UPDATE SET "
+            "  used = CASE WHEN credit_usage.week = %s THEN credit_usage.used + 1 ELSE 1 END, "
+            "  week = %s",
+            (username, week, week, week),
+        )
+
+
+def _reset_user_credits(username: str) -> None:
+    conn = _get_db_conn()
+    week = _current_week_start()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO credit_usage (username, week, used) VALUES (%s, %s, 0) "
+            "ON CONFLICT (username) DO UPDATE SET week = %s, used = 0",
+            (username, week, week),
+        )
+
+
+# ============================================================================
+# AUTH GATE
+# ============================================================================
+def _get_users() -> dict:
+    """Load user definitions from st.secrets['users']."""
+    try:
+        return dict(st.secrets["users"])
+    except (KeyError, FileNotFoundError):
+        return {}
+
+
+def check_password() -> bool:
+    """Per-user login: username + password.  Sets session_state on success."""
+    if st.session_state.get("authenticated"):
+        return True
+
+    users = _get_users()
+    if not users:
+        st.error("No users configured in Streamlit secrets.")
+        st.stop()
+
+    st.title("\U0001f512 Memo Chef — Login")
+    with st.form("login_form"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Log in")
+    if submitted:
+        user_cfg = users.get(username)
+        if user_cfg and _verify_password(password, user_cfg["password_hash"]):
+            st.session_state["authenticated"] = True
+            st.session_state["username"] = username
+            st.session_state["role"] = user_cfg.get("role", "user")
+            st.session_state["credits_per_week"] = int(
+                user_cfg.get("credits_per_week", 5)
+            )
+            st.rerun()
+        else:
+            st.error("Invalid username or password.")
+    st.stop()
+
+
+if not check_password():
+    st.stop()
+
+# ============================================================================
+# SIDEBAR — user info, credits, admin panel
+# ============================================================================
+_username = st.session_state["username"]
+_role = st.session_state["role"]
+_credits_per_week = st.session_state["credits_per_week"]
+_used, _remaining = _get_user_credits(_username, _credits_per_week)
+
+with st.sidebar:
+    st.markdown(f"**{_username}** &nbsp; `{_role}`")
+    st.caption(f"Credits: {_remaining} / {_credits_per_week} remaining this week")
+    st.progress(
+        min(_used / _credits_per_week, 1.0) if _credits_per_week > 0 else 1.0,
+        text=f"{_used} used",
+    )
+    if st.button("Clock out"):
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        st.rerun()
+
+    # Admin panel
+    if _role == "admin":
+        st.divider()
+        st.subheader("Admin Panel")
+        users = _get_users()
+        rows = []
+        for uname, ucfg in users.items():
+            cpw = int(ucfg.get("credits_per_week", 5))
+            u, r = _get_user_credits(uname, cpw)
+            rows.append(
+                {"User": uname, "Role": ucfg.get("role", "user"),
+                 "Used": u, "Limit": cpw, "Remaining": r}
+            )
+        st.table(rows)
+        reset_user = st.selectbox(
+            "Reset credits for", [r["User"] for r in rows], index=None,
+            placeholder="Select a user...",
+        )
+        if reset_user and st.button(f"Reset {reset_user}"):
+            _reset_user_credits(reset_user)
+            st.rerun()
+
 st.title("\U0001f9d1\u200d\U0001f373 Memo Chef")
 st.caption("From raw ingredients to a Michelin-star memo")
 
@@ -39,101 +276,122 @@ CHEF_SHRIMP_HTML = """
 <style>
 @keyframes chef-bounce {
   0%, 100% { transform: translateY(0); }
-  50% { transform: translateY(-10px); }
+  50% { transform: translateY(-8px); }
 }
-@keyframes arm-flip {
-  0%, 100% { transform: rotate(0deg); }
-  25% { transform: rotate(-20deg); }
-  50% { transform: rotate(10deg); }
-  75% { transform: rotate(-15deg); }
+@keyframes stir {
+  0%   { transform: rotate(-15deg); }
+  50%  { transform: rotate(15deg); }
+  100% { transform: rotate(-15deg); }
 }
 @keyframes flame-dance {
-  0%, 100% { transform: scaleY(1) scaleX(1); opacity: 0.9; }
+  0%, 100% { transform: scaleY(1) scaleX(1); opacity: 0.85; }
   25% { transform: scaleY(1.5) scaleX(0.8); opacity: 1; }
   50% { transform: scaleY(0.8) scaleX(1.2); opacity: 0.7; }
   75% { transform: scaleY(1.3) scaleX(0.9); opacity: 1; }
 }
 @keyframes steam-rise {
-  0% { opacity: 0.8; transform: translateY(0) scale(1); }
-  100% { opacity: 0; transform: translateY(-60px) scale(2); }
+  0% { opacity: 0.7; transform: translateY(0) scale(1); }
+  100% { opacity: 0; transform: translateY(-55px) scale(2); }
 }
 @keyframes pan-tilt {
   0%, 100% { transform: rotate(0deg); }
-  30% { transform: rotate(-3deg); }
-  60% { transform: rotate(3deg); }
+  30% { transform: rotate(-2deg); }
+  60% { transform: rotate(2deg); }
 }
 @keyframes sparkle {
   0%, 100% { opacity: 0; transform: scale(0.5) translateY(0); }
-  50% { opacity: 1; transform: scale(1.2) translateY(-20px); }
+  50% { opacity: 1; transform: scale(1.2) translateY(-18px); }
 }
 .chef-scene {
-  display: flex; justify-content: center; align-items: end;
-  height: 220px; margin: 10px 0 15px 0; user-select: none;
+  display: flex; justify-content: center; align-items: flex-end;
+  height: 240px; margin: 10px 0 15px 0; user-select: none;
   position: relative;
 }
-.chef-group { position: relative; }
-.chef-shrimp {
-  font-size: 72px; position: relative; z-index: 5;
-  animation: chef-bounce 1s ease-in-out infinite;
+.chef-group {
+  position: relative;
+  display: flex; align-items: flex-end; gap: 0;
 }
-.chef-hat {
-  font-size: 36px; position: absolute; z-index: 6;
-  top: -28px; left: 50%; transform: translateX(-50%);
-  animation: chef-bounce 1s ease-in-out infinite;
+/* --- the shrimp chef character --- */
+.shrimp-chef {
+  position: relative; z-index: 5;
+  animation: chef-bounce 1.1s ease-in-out infinite;
+}
+.chef-toque {
+  font-size: 32px; position: absolute; z-index: 7;
+  top: -30px; left: 50%; transform: translateX(-50%);
+}
+.shrimp-body { font-size: 80px; display: block; }
+.chef-coat {
+  font-size: 11px; position: absolute; bottom: 8px;
+  left: 50%; transform: translateX(-50%);
+  background: #fff; border: 2px solid #ddd; border-radius: 4px;
+  padding: 1px 8px; white-space: nowrap; font-weight: bold;
+  color: #333; letter-spacing: 0.5px; z-index: 6;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.12);
+}
+/* spatula arm */
+.spatula {
+  font-size: 38px; position: absolute; z-index: 8;
+  top: 12px; right: -30px;
+  animation: stir 0.7s ease-in-out infinite;
+  transform-origin: bottom center;
+}
+/* --- pan + fire station --- */
+.station {
+  position: relative; margin-left: -10px; margin-bottom: -5px;
 }
 .pan-area {
-  position: absolute; bottom: -10px; left: 80px; z-index: 3;
   animation: pan-tilt 1.2s ease-in-out infinite;
   transform-origin: center bottom;
+  position: relative; z-index: 3;
 }
-.pan-emoji { font-size: 64px; }
-.pan-arm {
-  font-size: 30px; position: absolute; z-index: 4;
-  top: -20px; right: 55px;
-  animation: arm-flip 0.8s ease-in-out infinite;
-  transform-origin: bottom right;
-}
+.pan-emoji { font-size: 70px; }
 .flame-bit {
   position: absolute; font-size: 24px; z-index: 2;
   animation: flame-dance 0.35s ease-in-out infinite alternate;
 }
-.f1 { bottom: -15px; left: 95px; animation-delay: 0s; }
-.f2 { bottom: -12px; left: 115px; animation-delay: 0.12s; }
-.f3 { bottom: -15px; left: 135px; animation-delay: 0.25s; }
-.f4 { bottom: -10px; left: 155px; animation-delay: 0.08s; }
+.f1 { bottom: -12px; left: 8px; animation-delay: 0s; }
+.f2 { bottom: -9px;  left: 28px; animation-delay: 0.12s; }
+.f3 { bottom: -12px; left: 48px; animation-delay: 0.25s; }
+.f4 { bottom: -9px;  left: 68px; animation-delay: 0.08s; }
 .steam-puff {
-  position: absolute; font-size: 20px; z-index: 7;
+  position: absolute; font-size: 18px; z-index: 7;
   animation: steam-rise 1.6s ease-out infinite;
 }
-.st1 { top: -10px; left: 100px; animation-delay: 0s; }
-.st2 { top: -15px; left: 125px; animation-delay: 0.5s; }
-.st3 { top: -5px; left: 150px; animation-delay: 1s; }
+.st1 { top: -15px; left: 10px; animation-delay: 0s; }
+.st2 { top: -20px; left: 35px; animation-delay: 0.5s; }
+.st3 { top: -12px; left: 60px; animation-delay: 1s; }
 .sparkle {
-  position: absolute; font-size: 16px; z-index: 8;
-  animation: sparkle 1.2s ease-in-out infinite;
+  position: absolute; font-size: 14px; z-index: 9;
+  animation: sparkle 1.3s ease-in-out infinite;
 }
-.sp1 { top: -20px; left: 90px; animation-delay: 0.2s; }
-.sp2 { top: -30px; left: 140px; animation-delay: 0.7s; }
-.sp3 { top: -15px; left: 170px; animation-delay: 1.1s; }
+.sp1 { top: -25px; left: 5px;  animation-delay: 0.2s; }
+.sp2 { top: -35px; left: 40px; animation-delay: 0.8s; }
+.sp3 { top: -20px; left: 72px; animation-delay: 1.2s; }
 </style>
 <div class="chef-scene">
   <div class="chef-group">
-    <div class="chef-hat">\U0001f468\u200d\U0001f373</div>
-    <div class="chef-shrimp">\U0001f990</div>
-    <div class="pan-arm">\U0001f4a8</div>
-    <div class="pan-area">
-      <div class="pan-emoji">\U0001f373</div>
+    <div class="shrimp-chef">
+      <div class="chef-toque">\U0001f9d1\u200d\U0001f373</div>
+      <span class="shrimp-body">\U0001f990</span>
+      <div class="chef-coat">CHEF</div>
+      <div class="spatula">\U0001f944</div>
     </div>
-    <div class="flame-bit f1">\U0001f525</div>
-    <div class="flame-bit f2">\U0001f525</div>
-    <div class="flame-bit f3">\U0001f525</div>
-    <div class="flame-bit f4">\U0001f525</div>
-    <div class="steam-puff st1">\u2668\ufe0f</div>
-    <div class="steam-puff st2">\u2668\ufe0f</div>
-    <div class="steam-puff st3">\u2668\ufe0f</div>
-    <div class="sparkle sp1">\u2728</div>
-    <div class="sparkle sp2">\u2728</div>
-    <div class="sparkle sp3">\u2728</div>
+    <div class="station">
+      <div class="steam-puff st1">\u2668\ufe0f</div>
+      <div class="steam-puff st2">\u2668\ufe0f</div>
+      <div class="steam-puff st3">\u2668\ufe0f</div>
+      <div class="sparkle sp1">\u2728</div>
+      <div class="sparkle sp2">\u2728</div>
+      <div class="sparkle sp3">\u2728</div>
+      <div class="pan-area">
+        <div class="pan-emoji">\U0001f373</div>
+      </div>
+      <div class="flame-bit f1">\U0001f525</div>
+      <div class="flame-bit f2">\U0001f525</div>
+      <div class="flame-bit f3">\U0001f525</div>
+      <div class="flame-bit f4">\U0001f525</div>
+    </div>
   </div>
 </div>
 """
@@ -145,10 +403,8 @@ CHEF_SHRIMP_HTML = """
 def _get_api_key() -> str | None:
     try:
         return st.secrets["ANTHROPIC_API_KEY"]
-    except Exception:
-        load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
-        load_dotenv()
-        return os.getenv("ANTHROPIC_API_KEY")
+    except (KeyError, FileNotFoundError):
+        return None
 
 
 # ============================================================================
@@ -167,9 +423,10 @@ class _LogCapture(logging.Handler):
 # MISE EN PLACE  (ingredient uploaders)
 # ============================================================================
 st.subheader("\U0001f52a Mise en Place")
-col1, col2 = st.columns(2)
+col1, col2, col3 = st.columns(3)
 memo_file = col1.file_uploader("The Memo (.pptx)", type=["pptx"])
 proforma_file = col2.file_uploader("The Proforma (.xlsx / .xlsm)", type=["xlsx", "xlsm"])
+schedule_file = col3.file_uploader("The Schedule (.mpp)", type=["mpp"])
 
 property_name = st.text_input(
     "Property Name (as shown in proforma)",
@@ -185,13 +442,19 @@ with st.expander("\U0001f9c2 Chef's Preferences"):
     skip_validation = st.checkbox("Skip the sous-chef QA pass (express ticket)")
 
 # ============================================================================
-# FIRE BUTTON
+# FIRE BUTTON (credit-gated)
 # ============================================================================
-if st.button(
-    "\U0001f525  Fire!",
-    type="primary",
-    disabled=not (memo_file and proforma_file),
-):
+_fire_disabled = not (memo_file and proforma_file) or _remaining <= 0
+_fire_label = (
+    f"\U0001f525  Fire!  ({_remaining} credits left)"
+    if _remaining > 0
+    else "\U0001f6ab  No credits remaining"
+)
+
+if st.button(_fire_label, type="primary", disabled=_fire_disabled):
+    # Consume a credit up front
+    _consume_credit(_username)
+
     # Clear previous results
     for key in ["memo_bytes", "log_bytes", "filename", "n_changes",
                 "n_rejected", "n_missed", "log_lines"]:
@@ -201,17 +464,17 @@ if st.button(
     if not api_key:
         st.error(
             "86'd! ANTHROPIC_API_KEY not found. "
-            "Add it to .env (local) or Streamlit secrets (cloud)."
+            "Add it to Streamlit secrets (.streamlit/secrets.toml or Cloud dashboard)."
         )
         st.stop()
 
-    tmpdir = tempfile.mkdtemp()
     logger = logging.getLogger("memo_automator")
     log_handler = _LogCapture()
     log_handler.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s"))
     logger.addHandler(log_handler)
 
-    try:
+    with tempfile.TemporaryDirectory() as tmpdir:
+      try:
         # Save uploaded files to tmpdir
         memo_path = os.path.join(tmpdir, memo_file.name)
         proforma_path = os.path.join(tmpdir, proforma_file.name)
@@ -247,12 +510,34 @@ if st.button(
             # Step b: Extract proforma
             progress_bar.progress(8, text="\U0001f52a Breaking down the proforma...")
             st.write("\U0001f52a Breaking down the proforma...")
-            proforma_data = extract_proforma_data(proforma_path, cfg)
+            try:
+                proforma_data = extract_proforma_data(proforma_path, cfg)
+            except Exception as e:
+                st.error(f"Could not read the proforma file. Is it a valid .xlsx/.xlsm? ({e})")
+                st.stop()
+
+            # Step b2: Extract schedule (optional)
+            if schedule_file:
+                progress_bar.progress(12, text="\U0001f4c5 Reading the schedule...")
+                st.write("\U0001f4c5 Reading the schedule...")
+                schedule_path = os.path.join(tmpdir, schedule_file.name)
+                with open(schedule_path, "wb") as f:
+                    f.write(schedule_file.getvalue())
+                try:
+                    schedule_data = extract_schedule_data(schedule_path, cfg)
+                    proforma_data += "\n\n" + schedule_data
+                except Exception as e:
+                    st.error(f"Could not read the schedule. Is it a valid .mpp? ({e})")
+                    st.stop()
 
             # Step c: Extract memo
             progress_bar.progress(15, text="\U0001f4dc Reading the old ticket...")
             st.write("\U0001f4dc Reading the old ticket...")
-            memo_content = extract_memo_content(memo_path, cfg)
+            try:
+                memo_content = extract_memo_content(memo_path, cfg)
+            except Exception as e:
+                st.error(f"Could not read the memo file. Is it a valid .pptx? ({e})")
+                st.stop()
 
             # Step d: Map metrics (mirrors main() batching logic exactly)
             # Progress: 15% -> 70% for mapping
@@ -266,7 +551,7 @@ if st.button(
             if prompt_size > BATCH_THRESHOLD:
                 memo_chunks = chunk_memo_by_pages(memo_content, pages_per_chunk=3)
                 n_chunks = len(memo_chunks)
-                mappings = {"table_updates": [], "text_updates": []}
+                mappings = {"table_updates": [], "text_updates": [], "row_inserts": []}
                 last_api_call = 0
 
                 for i, chunk in enumerate(memo_chunks, 1):
@@ -283,8 +568,13 @@ if st.button(
                             time.sleep(wait)
 
                     last_api_call = time.time()
-                    batch = get_metric_mappings(client, proforma_data, chunk, cfg,
-                                               property_name=property_name)
+                    try:
+                        batch = get_metric_mappings(client, proforma_data, chunk, cfg,
+                                                   property_name=property_name)
+                    except (anthropic.APIError, anthropic.APIConnectionError, Exception) as e:
+                        st.warning(f"Batch {i}/{n_chunks} failed: {e}")
+                        batch = {"table_updates": [], "text_updates": [],
+                                 "row_inserts": [], "_truncated": True}
 
                     if batch.pop("_truncated", False):
                         covered_pages = set()
@@ -292,8 +582,11 @@ if st.button(
                             covered_pages.add(e.get("page"))
                         for e in batch.get("text_updates", []):
                             covered_pages.add(e.get("page"))
+                        for e in batch.get("row_inserts", []):
+                            covered_pages.add(e.get("page"))
                         mappings["table_updates"].extend(batch.get("table_updates", []))
                         mappings["text_updates"].extend(batch.get("text_updates", []))
+                        mappings["row_inserts"].extend(batch.get("row_inserts", []))
 
                         sub_chunks = chunk_memo_by_pages(chunk, pages_per_chunk=1)
                         for j, sub_chunk in enumerate(sub_chunks, 1):
@@ -309,10 +602,14 @@ if st.button(
                                 time.sleep(wait)
 
                             last_api_call = time.time()
-                            sub_batch = get_metric_mappings(
-                                client, proforma_data, sub_chunk, cfg,
-                                property_name=property_name,
-                            )
+                            try:
+                                sub_batch = get_metric_mappings(
+                                    client, proforma_data, sub_chunk, cfg,
+                                    property_name=property_name,
+                                )
+                            except (anthropic.APIError, anthropic.APIConnectionError, Exception) as e:
+                                st.warning(f"Sub-batch {j} retry failed: {e}")
+                                continue
                             sub_batch.pop("_truncated", False)
                             mappings["table_updates"].extend(
                                 sub_batch.get("table_updates", [])
@@ -320,9 +617,13 @@ if st.button(
                             mappings["text_updates"].extend(
                                 sub_batch.get("text_updates", [])
                             )
+                            mappings["row_inserts"].extend(
+                                sub_batch.get("row_inserts", [])
+                            )
                     else:
                         mappings["table_updates"].extend(batch.get("table_updates", []))
                         mappings["text_updates"].extend(batch.get("text_updates", []))
+                        mappings["row_inserts"].extend(batch.get("row_inserts", []))
             else:
                 mappings = get_metric_mappings(client, proforma_data, memo_content, cfg,
                                                property_name=property_name)
@@ -364,15 +665,34 @@ if st.button(
             st.write("\U0001f37d\ufe0f Plating the dish...")
             changes = apply_updates(memo_path, validated, dry_run=dry_run)
 
-            # Step g: Write change log — 96%
+            # Step g: Apply Subtext branding — 93%
+            progress_bar.progress(93, text="\U0001f3a8 Applying Subtext branding...")
+            st.write("\U0001f3a8 Applying Subtext branding...")
+            theme_path = cfg.get("branding", {}).get("theme_path", "")
+            if not theme_path:
+                # Default: look for theme beside this script
+                theme_path = os.path.join(os.path.dirname(__file__), "Subtext Brand Theme.thmx")
+            if os.path.exists(theme_path) and not dry_run:
+                n_branded = apply_branding(memo_path, theme_path, cfg)
+                st.write(f"\U0001f3a8 Branded {n_branded} text runs")
+            elif not os.path.exists(theme_path):
+                st.warning("Subtext Brand Theme not found — skipping branding")
+
+            # Step g2: Normalize layout — 95%
+            if not dry_run:
+                progress_bar.progress(95, text="Aligning layout...")
+                st.write("\U0001f4d0 Aligning layout...")
+                layout_summary = normalize_layout(memo_path, cfg)
+                log.info("Layout normalized: %s", layout_summary)
+                st.write(f"\U0001f4d0 Layout healed: {layout_summary['titles_snapped']} titles, "
+                         f"{layout_summary['page_numbers_snapped']} page numbers snapped")
+
+            # Step h: Write change log — 96%
             progress_bar.progress(96, text="\U0001f4cb Printing the ticket...")
             st.write("\U0001f4cb Printing the ticket...")
             log_path = write_change_log(
                 tmpdir, changes, validated, memo_path, proforma_path, backup_path
             )
-
-            # Hide animation now that we're done
-            anim_placeholder.empty()
 
             n_changes = len(changes)
             progress_bar.progress(100, text=f"\U0001f31f Order up! {n_changes} updates plated.")
@@ -399,14 +719,17 @@ if st.button(
         st.session_state["n_missed"] = n_missed
         st.session_state["log_lines"] = log_handler.lines[:]
 
-    except Exception as e:
-        anim_placeholder = None  # may not be defined if error was early
+      except Exception as e:
         st.error(f"In the weeds! {e}")
         raise
 
-    finally:
+      finally:
+        # Always clear animation and clean up logging handler
+        try:
+            anim_placeholder.empty()
+        except Exception:
+            pass
         logger.removeHandler(log_handler)
-        shutil.rmtree(tmpdir, ignore_errors=True)
 
 # ============================================================================
 # SERVICE WINDOW  (results -- persists from session_state across reruns)
