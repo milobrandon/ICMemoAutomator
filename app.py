@@ -41,52 +41,70 @@ st.set_page_config(page_title="Memo Chef", page_icon="\U0001f9d1\u200d\U0001f373
 # ============================================================================
 st.markdown("""
 <style>
+    .stApp { background-color: #2b2825 !important; }
     .stButton > button[kind="primary"], button[kind="primary"] {
-        background-color: #16352e !important;
-        border-color: #16352e !important;
-        color: #f7f1e3 !important;
+        background-color: #c1d100 !important;
+        border-color: #c1d100 !important;
+        color: #2b2825 !important;
+        font-weight: 600 !important;
+        border-radius: 9999px !important;
     }
     .stButton > button[kind="primary"]:hover, button[kind="primary"]:hover {
-        background-color: #1e4a3f !important;
-        border-color: #1e4a3f !important;
+        filter: brightness(110%) !important;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.15) !important;
     }
     .stButton > button:not([kind="primary"]), .stDownloadButton > button {
-        background-color: #e8dece !important;
-        border: 1px solid #2b2825 !important;
-        color: #2b2825 !important;
+        background-color: transparent !important;
+        border: 2px solid #c1d100 !important;
+        color: #c1d100 !important;
+        border-radius: 9999px !important;
+        font-weight: 500 !important;
     }
     .stDownloadButton > button:hover, .stButton > button:not([kind="primary"]):hover {
-        background-color: #d9cab5 !important;
+        background-color: rgba(193,209,0,0.1) !important;
     }
     section[data-testid="stSidebar"] {
-        background-color: #2b2825 !important;
+        background-color: #1e342e !important;
+        border-right: 3px solid #c1d100 !important;
     }
-    section[data-testid="stSidebar"] * {
+    section[data-testid="stSidebar"] * { color: #f7f1e3 !important; }
+    section[data-testid="stSidebar"] .stProgress > div > div { background-color: #c1d100 !important; }
+    .stProgress > div > div > div { background-color: #c1d100 !important; }
+    .stProgress > div > div { background-color: rgba(247,241,227,0.1) !important; }
+    [data-testid="stFileUploader"] { border-color: rgba(193,209,0,0.3) !important; }
+    [data-testid="stFileUploader"]:hover { border-color: #c1d100 !important; }
+    [data-testid="stFileUploader"] button { color: #c1d100 !important; border-color: #c1d100 !important; }
+    .streamlit-expanderHeader { color: #f7f1e3 !important; }
+    details { border-color: rgba(193,209,0,0.2) !important; }
+    [data-testid="stMetricValue"] { color: #c1d100 !important; }
+    [data-testid="stMetricLabel"] { color: #f7f1e3 !important; }
+    [data-testid="stStatusWidget"] { border-color: #c1d100 !important; background-color: #1e342e !important; }
+    .stTextInput input, .stSelectbox [data-baseweb="select"], .stMultiSelect [data-baseweb="select"] {
+        background-color: rgba(247,241,227,0.05) !important;
+        border-color: rgba(247,241,227,0.2) !important;
         color: #f7f1e3 !important;
     }
-    section[data-testid="stSidebar"] .stProgress > div > div {
-        background-color: #c1d100 !important;
-    }
-    .stProgress > div > div > div {
-        background-color: #16352e !important;
-    }
-    [data-testid="stFileUploader"] { border-color: #a95818 !important; }
-    [data-testid="stFileUploader"] button { color: #16352e !important; border-color: #16352e !important; }
-    .streamlit-expanderHeader { color: #512213 !important; }
-    [data-testid="stMetricValue"] { color: #16352e !important; }
-    [data-testid="stStatusWidget"] { border-color: #a95818 !important; }
-    .stTextInput input:focus {
-        border-color: #16352e !important;
-        box-shadow: 0 0 0 1px #16352e !important;
-    }
+    .stTextInput input:focus { border-color: #c1d100 !important; box-shadow: 0 0 0 1px #c1d100 !important; }
     .stForm button[kind="secondaryFormSubmit"] {
-        background-color: #16352e !important;
-        color: #f7f1e3 !important;
-        border-color: #16352e !important;
+        background-color: #c1d100 !important;
+        color: #2b2825 !important;
+        border-color: #c1d100 !important;
+        border-radius: 9999px !important;
+        font-weight: 600 !important;
     }
-    a { color: #a95818 !important; }
-    a:hover { color: #512213 !important; }
-    hr { border-color: #a95818 !important; }
+    [data-testid="stAlert"] {
+        background-color: rgba(30,52,46,0.8) !important;
+        border-left: 4px solid #c1d100 !important;
+        color: #f7f1e3 !important;
+    }
+    a { color: #c1d100 !important; }
+    a:hover { color: #d4e34d !important; }
+    hr { border: none !important; border-top: 3px solid #c1d100 !important; margin: 1.5rem 0 !important; }
+    .stCodeBlock, code { background-color: #1e342e !important; }
+    .stTable, [data-testid="stTable"] { background-color: rgba(30,52,46,0.4) !important; }
+    thead th { color: #c1d100 !important; border-bottom: 2px solid #c1d100 !important; }
+    tbody td { color: #f7f1e3 !important; border-bottom: 1px solid rgba(247,241,227,0.1) !important; }
+    .stCaption, [data-testid="stCaptionContainer"] { color: rgba(247,241,227,0.6) !important; }
 </style>
 """, unsafe_allow_html=True)
 
